@@ -404,6 +404,273 @@ __global__ void bias_backward_kernel(float *grad_output, float *grad_bias, int b
 
 The math in row one is *identical* in every column — that's the whole point of this chapter. What changes is only **who does the parallelization and the bookkeeping**: you, by hand, in NumPy and C; you, explicitly, per-thread in raw CUDA; or a library (PyTorch's autograd, cuBLAS's kernels), invisibly. Part 4 picks up exactly here — wiring custom kernels like the ones in `v4.cu` into PyTorch's autograd system directly, so you get hand-written kernels *and* automatic differentiation at the same time.
 
+## 4.9 Running These Kernels from Python (a Sixth Implementation)
+
+The table above has five columns. This section adds an honest sixth: the same math, run as raw CUDA kernels wrapped for Python via `load_inline` (Chapter 3 §3.6's technique), orchestrated by a plain Python function instead of C's `main()` — the natural stepping stone to Chapter 5's *proper* PyTorch-autograd integration.
+
+**A provenance note, since this section mixes sources more than §3.6 did:** four of the ten kernels below are copied verbatim from §4.6's confirmed `v4.cu` source (`matmul_a_b_kernel`, `softmax_kernel`, `compute_output_gradients_kernel`, `weight_update_kernel`). Two (`matmul_a_bt_kernel`, `matmul_at_b_kernel`) are **my own CUDA translation** of §4.5's confirmed `v3.c` functions, following the "close to mechanical" rule §4.6 itself states — not a claim that this is byte-for-byte `v4.cu` source I've directly seen. The remaining four (`bias_forward`, `relu_forward`, `relu_backward`, `bias_backward`) are straightforward operations I wrote myself in this course's established naive style, since the book's exact `v4.cu` text for these wasn't quoted earlier in this chapter — `relu_backward`'s formula is still §4.5's confirmed `d_ReLU_out[i] = dX2[i] * (hidden[i] > 0)` line, just as a kernel instead of a C loop.
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ---------- Confirmed verbatim, §4.6 ----------
+
+__global__ void matmul_a_b_kernel(float *A, float *B, float *C, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < m && col < k) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) sum += A[row * n + i] * B[i * k + col];
+        C[row * k + col] = sum;
+    }
+}
+
+__global__ void softmax_kernel(float *x, int batch_size, int size) {
+    int b = blockIdx.x;   // one block per row — the deliberately naive pattern §4.6 discusses at length
+    if (b < batch_size) {
+        float max_val = x[b * size];
+        for (int i = 1; i < size; ++i) max_val = fmaxf(max_val, x[b * size + i]);
+        float sum = 0.0f;
+        for (int i = 0; i < size; ++i) { x[b*size+i] = expf(x[b*size+i]-max_val); sum += x[b*size+i]; }
+        for (int i = 0; i < size; ++i) x[b*size+i] = fmaxf(x[b*size+i] / sum, 1e-7f);
+    }
+}
+
+__global__ void compute_output_gradients_kernel(float *grad_output, float *output, int *labels, int batch_size, int output_size) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < batch_size) {
+        for (int i = 0; i < output_size; ++i) grad_output[b*output_size+i] = output[b*output_size+i];
+        grad_output[b * output_size + labels[b]] -= 1.0f;
+        for (int i = 0; i < output_size; ++i) grad_output[b*output_size+i] /= batch_size;
+    }
+}
+
+__global__ void weight_update_kernel(float *weights, float *grad_weights, float lr, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) weights[idx] -= lr * grad_weights[idx];   // lr is now a parameter, not a #define, for reuse from Python
+}
+
+// ---------- My CUDA translation of confirmed v3.c (§4.5) ----------
+
+__global__ void matmul_a_bt_kernel(float *A, float *B, float *C, int m, int n, int k) {
+    // C = A @ B^T.  A:(m,n)  B:(k,n)  C:(m,k)
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < m && col < k) {
+        float sum = 0.0f;
+        for (int l = 0; l < n; ++l) sum += A[row * n + l] * B[col * n + l];
+        C[row * k + col] = sum;
+    }
+}
+
+__global__ void matmul_at_b_kernel(float *A, float *B, float *C, int m, int n, int k) {
+    // C = A^T @ B.  A:(m,n)  B:(m,k)  C:(n,k) -- output rows are n, not m
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < n && col < k) {
+        float sum = 0.0f;
+        for (int l = 0; l < m; ++l) sum += A[l * n + row] * B[l * k + col];
+        C[row * k + col] = sum;
+    }
+}
+
+// ---------- Written for this section, in this course's established naive style ----------
+
+__global__ void bias_forward_kernel(float *x, const float *bias, int batch_size, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * size) x[idx] += bias[idx % size];
+}
+
+__global__ void relu_forward_kernel(float *x, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) x[idx] = fmaxf(x[idx], 0.0f);
+}
+
+__global__ void relu_backward_kernel(const float *grad_out, const float *relu_output, float *grad_in, int n) {
+    // relu_output[i] > 0  iff  the pre-activation value was > 0 -- no separate pre-activation
+    // buffer needed, exactly §4.5's masking trick, reusing the post-ReLU buffer.
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) grad_in[idx] = grad_out[idx] * (relu_output[idx] > 0.0f ? 1.0f : 0.0f);
+}
+
+__global__ void bias_backward_kernel(const float *grad_out, float *grad_bias, int batch_size, int size) {
+    int feature = blockIdx.x * blockDim.x + threadIdx.x;
+    if (feature < size) {
+        float sum = 0.0f;
+        for (int b = 0; b < batch_size; ++b) sum += grad_out[b * size + feature];
+        grad_bias[feature] = sum;
+    }
+}
+
+// ---------- Thin launchers: Chapter 5's binding pattern, arriving two chapters early ----------
+
+torch::Tensor matmul_a_b(torch::Tensor A, torch::Tensor B) {
+    int m = A.size(0), n = A.size(1), k = B.size(1);
+    auto C = torch::empty({m, k}, A.options());
+    dim3 t(16,16), g((k+15)/16, (m+15)/16);
+    matmul_a_b_kernel<<<g,t>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), m, n, k);
+    return C;
+}
+torch::Tensor matmul_a_bt(torch::Tensor A, torch::Tensor B) {
+    int m = A.size(0), n = A.size(1), k = B.size(0);
+    auto C = torch::empty({m, k}, A.options());
+    dim3 t(16,16), g((k+15)/16, (m+15)/16);
+    matmul_a_bt_kernel<<<g,t>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), m, n, k);
+    return C;
+}
+torch::Tensor matmul_at_b(torch::Tensor A, torch::Tensor B) {
+    int m = A.size(0), n = A.size(1), k = B.size(1);
+    auto C = torch::empty({n, k}, A.options());
+    dim3 t(16,16), g((k+15)/16, (n+15)/16);
+    matmul_at_b_kernel<<<g,t>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), m, n, k);
+    return C;
+}
+void bias_forward(torch::Tensor x, torch::Tensor bias) {
+    int batch = x.size(0), size = x.size(1), n = batch*size, threads=256, blocks=(n+threads-1)/threads;
+    bias_forward_kernel<<<blocks,threads>>>(x.data_ptr<float>(), bias.data_ptr<float>(), batch, size);
+}
+void relu_forward(torch::Tensor x) {
+    int n = x.numel(), threads=256, blocks=(n+threads-1)/threads;
+    relu_forward_kernel<<<blocks,threads>>>(x.data_ptr<float>(), n);
+}
+torch::Tensor relu_backward(torch::Tensor grad_out, torch::Tensor relu_output) {
+    auto grad_in = torch::empty_like(grad_out);
+    int n = grad_out.numel(), threads=256, blocks=(n+threads-1)/threads;
+    relu_backward_kernel<<<blocks,threads>>>(grad_out.data_ptr<float>(), relu_output.data_ptr<float>(), grad_in.data_ptr<float>(), n);
+    return grad_in;
+}
+torch::Tensor bias_backward(torch::Tensor grad_out) {
+    int batch = grad_out.size(0), size = grad_out.size(1);
+    auto grad_bias = torch::empty({size}, grad_out.options());
+    int threads=256, blocks=(size+threads-1)/threads;
+    bias_backward_kernel<<<blocks,threads>>>(grad_out.data_ptr<float>(), grad_bias.data_ptr<float>(), batch, size);
+    return grad_bias;
+}
+void softmax_(torch::Tensor x) {
+    int batch = x.size(0), size = x.size(1);
+    softmax_kernel<<<batch,1>>>(x.data_ptr<float>(), batch, size);   // still <<<batch_size,1>>> -- on purpose, see §4.6
+}
+torch::Tensor compute_output_gradients(torch::Tensor output, torch::Tensor labels) {
+    int batch = output.size(0), size = output.size(1);
+    auto grad = torch::empty_like(output);
+    int threads=256, blocks=(batch+threads-1)/threads;
+    compute_output_gradients_kernel<<<blocks,threads>>>(grad.data_ptr<float>(), output.data_ptr<float>(), labels.data_ptr<int>(), batch, size);
+    return grad;
+}
+void weight_update(torch::Tensor weights, torch::Tensor grad, double lr) {
+    int n = weights.numel(), threads=256, blocks=(n+threads-1)/threads;
+    weight_update_kernel<<<blocks,threads>>>(weights.data_ptr<float>(), grad.data_ptr<float>(), (float)lr, n);
+}
+"""
+
+cpp_source = r"""
+torch::Tensor matmul_a_b(torch::Tensor A, torch::Tensor B);
+torch::Tensor matmul_a_bt(torch::Tensor A, torch::Tensor B);
+torch::Tensor matmul_at_b(torch::Tensor A, torch::Tensor B);
+void bias_forward(torch::Tensor x, torch::Tensor bias);
+void relu_forward(torch::Tensor x);
+torch::Tensor relu_backward(torch::Tensor grad_out, torch::Tensor relu_output);
+torch::Tensor bias_backward(torch::Tensor grad_out);
+void softmax_(torch::Tensor x);
+torch::Tensor compute_output_gradients(torch::Tensor output, torch::Tensor labels);
+void weight_update(torch::Tensor weights, torch::Tensor grad, double lr);
+"""
+
+ch4 = load_inline(
+    name="ch4_mnist_kernels",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["matmul_a_b", "matmul_a_bt", "matmul_at_b", "bias_forward", "relu_forward",
+               "relu_backward", "bias_backward", "softmax_", "compute_output_gradients", "weight_update"],
+    verbose=True,
+)
+```
+
+The Python side orchestrates exactly §4.6's `forward_timed`/`backward_timed` call sequence, kernel by kernel, instead of C driving it:
+
+```python
+device = "cuda"
+torch.manual_seed(0)
+INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE, BATCH_SIZE, LR = 784, 256, 10, 8, 0.01
+
+def step_kernels(x, y, W1, b1, W2, b2, lr):
+    # ---- forward: §4.6's forward_timed ----
+    fc1 = ch4.matmul_a_b(x, W1)
+    ch4.bias_forward(fc1, b1)
+    ch4.relu_forward(fc1)                       # in-place; fc1 now holds the post-ReLU activations
+    relu_out = fc1
+    fc2 = ch4.matmul_a_b(relu_out, W2)
+    ch4.bias_forward(fc2, b2)
+    ch4.softmax_(fc2)                           # in-place; fc2 now holds softmax probabilities
+    probs = fc2
+
+    # ---- backward: §4.6's backward_timed ----
+    grad_out = ch4.compute_output_gradients(probs, y)   # (softmax_probs - one_hot) / batch, §4.1's formula
+    grad_W2 = ch4.matmul_at_b(relu_out, grad_out)        # x^T @ grad_output
+    grad_b2 = ch4.bias_backward(grad_out)
+    dX2 = ch4.matmul_a_bt(grad_out, W2)                  # grad_output @ weights^T
+    d_relu = ch4.relu_backward(dX2, relu_out)
+    grad_W1 = ch4.matmul_at_b(x, d_relu)
+    grad_b1 = ch4.bias_backward(d_relu)
+
+    # ---- weight update: §4.6's weight_update_kernel, once per parameter tensor ----
+    ch4.weight_update(W1, grad_W1, lr); ch4.weight_update(b1, grad_b1, lr)
+    ch4.weight_update(W2, grad_W2, lr); ch4.weight_update(b2, grad_b2, lr)
+    return probs
+```
+
+And a reference implementation using nothing but plain PyTorch tensor ops — the same formulas as `step_kernels`, with no autograd involved, so this is a true apples-to-apples check of the *math*, not of whether `nn.Module` happens to agree:
+
+```python
+def step_reference(x, y, W1, b1, W2, b2, lr):
+    fc1 = x @ W1 + b1
+    relu_out = fc1.clamp(min=0)
+    fc2 = relu_out @ W2 + b2
+    probs = torch.softmax(fc2, dim=1)
+
+    one_hot = torch.zeros_like(probs)
+    one_hot[torch.arange(len(y)), y.long()] = 1.0
+    grad_out = (probs - one_hot) / len(y)
+    grad_W2 = relu_out.t() @ grad_out
+    grad_b2 = grad_out.sum(dim=0)
+    dX2 = grad_out @ W2.t()
+    d_relu = dX2 * (fc1 > 0).float()
+    grad_W1 = x.t() @ d_relu
+    grad_b1 = d_relu.sum(dim=0)
+
+    W1 -= lr * grad_W1; b1 -= lr * grad_b1
+    W2 -= lr * grad_W2; b2 -= lr * grad_b2
+    return probs
+
+# Identical starting weights for both paths -- what makes this a fair comparison
+W1 = ((torch.rand(INPUT_SIZE, HIDDEN_SIZE, device=device) * 2 - 1) * (6/INPUT_SIZE)**0.5)
+b1 = torch.zeros(HIDDEN_SIZE, device=device)
+W2 = ((torch.rand(HIDDEN_SIZE, OUTPUT_SIZE, device=device) * 2 - 1) * (6/HIDDEN_SIZE)**0.5)
+b2 = torch.zeros(OUTPUT_SIZE, device=device)
+x = torch.rand(BATCH_SIZE, INPUT_SIZE, device=device)
+y = torch.randint(0, OUTPUT_SIZE, (BATCH_SIZE,), device=device, dtype=torch.int32)
+
+W1k, b1k, W2k, b2k = W1.clone(), b1.clone(), W2.clone(), b2.clone()
+W1r, b1r, W2r, b2r = W1.clone(), b1.clone(), W2.clone(), b2.clone()
+probs_kernels = step_kernels(x, y, W1k, b1k, W2k, b2k, LR)
+probs_ref     = step_reference(x, y, W1r, b1r, W2r, b2r, LR)
+
+def check(name, a, b, atol=1e-4):
+    d = (a - b).abs().max().item()
+    print(f"{name:10s} max_diff={d:.2e}  {'PASS' if d < atol else 'FAIL'}")
+
+for name, a, b in [("probs", probs_kernels, probs_ref), ("W1", W1k, W1r),
+                    ("b1", b1k, b1r), ("W2", W2k, W2r), ("b2", b2k, b2r)]:
+    check(name, a, b)
+```
+
+Every line should print `PASS` — forward activations, backward gradients, *and* the post-update weights all agree with a plain-PyTorch computation of the identical formulas, for one full training step. That's every gradient formula from §4.1, every kernel from §4.6, and the weight-update rule, all checked at once — the same verification discipline as Chapter 3 §3.6, now covering an entire training step instead of one isolated op.
+
 ---
 
 ## Hands-On Lab

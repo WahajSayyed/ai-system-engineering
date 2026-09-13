@@ -344,6 +344,199 @@ ncu --set full python train.py               # Nsight Compute — per-kernel dee
 
 You've already used `compute-sanitizer` (Chapters 2–4); `CUDA_LAUNCH_BLOCKING=1` is the tool you reach for specifically when an error is reported on the *wrong* line, because the actual failing kernel launched asynchronously several lines earlier.
 
+## 5.7 Reproducing These Kernels — and the Bug — from Python
+
+§5.1 already showed real Python wrapper code (`MatMulFunction`, `EmbeddingFunction`), but that code assumes the full `book.cu` repo cloned and built ahead-of-time via `setup.py`. This section gives you a **self-contained version**, using Chapter 3 §3.6's `load_inline` technique, covering three of this chapter's kernels — all copied verbatim from the confirmed source quoted earlier: `embedding_fwd_kernel`/`embedding_bwd_kernel` (§5.3), `gemv_kernel` (§5.4), and `topk_kernel` (§5.4) — the last of which lets you **trigger §5.5's tie-breaking bug yourself**, in isolation, without needing the full 24-layer MoE model.
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ---------- Confirmed verbatim, §5.3 ----------
+__global__ void embedding_fwd_kernel(const float* weight, const int* indices,
+                                   float* out, int num_indices, int n_embd) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = num_indices * n_embd;
+    if (idx < total_elements) {
+        int token_idx = idx / n_embd, emb_idx = idx % n_embd;
+        int weight_idx = indices[token_idx] * n_embd + emb_idx;
+        out[idx] = weight[weight_idx];
+    }
+}
+__global__ void embedding_bwd_kernel(const float* grad_out, const int* indices,
+                                   float* grad_weight, int num_indices, int n_embd) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = num_indices * n_embd;
+    if (idx < total_elements) {
+        int token_idx = idx / n_embd, emb_idx = idx % n_embd;
+        int weight_idx = indices[token_idx] * n_embd + emb_idx;
+        atomicAdd(&grad_weight[weight_idx], grad_out[idx]);
+    }
+}
+
+// ---------- Confirmed verbatim, §5.4 ----------
+__global__ void gemv_kernel(const float* A, const float* x, float* y, int batch, int M, int N) {
+    int batch_idx = blockIdx.z * blockDim.z + threadIdx.z;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (batch_idx < batch && row < M) {
+        float sum = 0.0f;
+        const float* A_batch = A + batch_idx * M * N;
+        const float* x_batch = x + batch_idx * N;
+        for (int col = 0; col < N; col++) sum += A_batch[row * N + col] * x_batch[col];
+        y[batch_idx * M + row] = sum;
+    }
+}
+
+__global__ void topk_kernel(const float* input, float* values, int* indices,
+                           int batch_size, int n, int k) {
+    int batch_idx = blockIdx.x;
+    if (batch_idx < batch_size) {
+        const float* input_row = input + batch_idx * n;
+        float* values_row = values + batch_idx * k;
+        int* indices_row = indices + batch_idx * k;
+        for (int i = 0; i < k; i++) { values_row[i] = -INFINITY; indices_row[i] = -1; }
+        for (int i = 0; i < n; i++) {
+            float val = input_row[i];
+            for (int j = 0; j < k; j++) {
+                if (val > values_row[j]) {              // <-- the exact line from §5.5. No tie-break.
+                    for (int m = k - 1; m > j; m--) { values_row[m] = values_row[m-1]; indices_row[m] = indices_row[m-1]; }
+                    values_row[j] = val;
+                    indices_row[j] = i;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ---------- Launchers ----------
+torch::Tensor embedding_fwd(torch::Tensor weight, torch::Tensor indices) {
+    int64_t num_indices = indices.numel();
+    int n_embd = weight.size(1);
+    auto out_shape = indices.sizes().vec(); out_shape.push_back(n_embd);
+    auto out = torch::empty(out_shape, weight.options());
+    int threads = 256, blocks = (num_indices * n_embd + threads - 1) / threads;
+    embedding_fwd_kernel<<<blocks, threads>>>(weight.data_ptr<float>(), indices.data_ptr<int>(), out.data_ptr<float>(), (int)num_indices, n_embd);
+    return out;
+}
+torch::Tensor embedding_bwd(torch::Tensor grad_out, torch::Tensor indices, int64_t num_embeddings) {
+    int n_embd = grad_out.size(-1);
+    int64_t num_indices = indices.numel();
+    auto grad_weight = torch::zeros({num_embeddings, n_embd}, grad_out.options());
+    int threads = 256, blocks = (num_indices * n_embd + threads - 1) / threads;
+    embedding_bwd_kernel<<<blocks, threads>>>(grad_out.contiguous().data_ptr<float>(), indices.data_ptr<int>(), grad_weight.data_ptr<float>(), (int)num_indices, n_embd);
+    return grad_weight;
+}
+torch::Tensor gemv(torch::Tensor A, torch::Tensor x) {
+    int batch = A.size(0), M = A.size(1), N = A.size(2);
+    auto y = torch::empty({batch, M}, A.options());
+    dim3 threads(1, 256, 1), blocks(1, (M + 255) / 256, batch);
+    gemv_kernel<<<blocks, threads>>>(A.data_ptr<float>(), x.data_ptr<float>(), y.data_ptr<float>(), batch, M, N);
+    return y;
+}
+std::vector<torch::Tensor> topk_naive(torch::Tensor input, int64_t k) {
+    int batch_size = input.size(0), n = input.size(1);
+    auto values = torch::empty({batch_size, k}, input.options());
+    auto indices = torch::empty({batch_size, k}, input.options().dtype(torch::kInt32));
+    topk_kernel<<<batch_size, 1>>>(input.data_ptr<float>(), values.data_ptr<float>(), indices.data_ptr<int>(), batch_size, n, (int)k);
+    return {values, indices};
+}
+"""
+
+cpp_source = r"""
+torch::Tensor embedding_fwd(torch::Tensor weight, torch::Tensor indices);
+torch::Tensor embedding_bwd(torch::Tensor grad_out, torch::Tensor indices, int64_t num_embeddings);
+torch::Tensor gemv(torch::Tensor A, torch::Tensor x);
+std::vector<torch::Tensor> topk_naive(torch::Tensor input, int64_t k);
+"""
+
+ch5 = load_inline(
+    name="ch5_transformer_kernels",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["embedding_fwd", "embedding_bwd", "gemv", "topk_naive"],
+    verbose=True,
+)
+```
+
+**Embedding, wired as a real `autograd.Function`** — the same shape as §5.1's `EmbeddingFunction`, now runnable immediately:
+
+```python
+import torch.nn.functional as F
+
+class EmbeddingFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight, indices):
+        ctx.save_for_backward(indices)
+        ctx.num_embeddings = weight.size(0)
+        return ch5.embedding_fwd(weight, indices)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        indices, = ctx.saved_tensors
+        grad_weight = ch5.embedding_bwd(grad_out.contiguous(), indices, ctx.num_embeddings)
+        return grad_weight, None      # None: indices are discrete, no gradient flows to them (§5.3)
+
+vocab, n_embd, batch, seq = 80, 128, 16, 64
+weight = torch.randn(vocab, n_embd, device="cuda", requires_grad=True)
+indices = torch.randint(0, vocab, (batch, seq), device="cuda", dtype=torch.int32)
+weight_ref = weight.detach().clone().requires_grad_(True)
+
+out_custom = EmbeddingFunction.apply(weight, indices)
+out_ref = F.embedding(indices.long(), weight_ref)
+print("embedding_fwd max_diff:", (out_custom - out_ref).abs().max().item())
+
+out_custom.sum().backward()
+out_ref.sum().backward()
+print("embedding_bwd max_diff:", (weight.grad - weight_ref.grad).abs().max().item())  # exercises the atomicAdd scatter (§5.3 deep dive)
+```
+
+**GEMV**, checked against a batched matrix-vector reference:
+
+```python
+batch, M, N = 4, 768, 768
+A = torch.randn(batch, M, N, device="cuda")
+x = torch.randn(batch, N, device="cuda")
+y_custom = ch5.gemv(A, x)
+y_ref = torch.bmm(A, x.unsqueeze(-1)).squeeze(-1)
+print("gemv max_diff:", (y_custom - y_ref).abs().max().item())
+```
+
+**Now the interesting part — triggering §5.5's bug directly, with two tiny, hand-built examples.**
+
+*Demonstration 1: exact ties, no floating-point noise needed at all.* Three candidates tie exactly, `k=2` (only two slots for three equally-good values):
+
+```python
+row = torch.tensor([[0.10, 0.40, 0.40, 0.40, 0.05, 0.03, 0.01, 0.01]], device="cuda")
+values, indices = ch5.topk_naive(row, 2)
+print("Selected experts:", indices.tolist())   # [[1, 2]] -- expert 3 loses, despite being numerically IDENTICAL to 1 and 2
+```
+
+Indices 1, 2, and 3 all hold exactly `0.40`. The kernel's strict `>` comparison means whichever of the three is scanned *first* claims a slot, and whichever is scanned *last* among equals never can (§5.4's source: `if (val > values_row[j])` never fires for a value equal to, not greater than, what's already there). Expert 3 loses this routing decision for no reason connected to its actual value — purely an artifact of scan order.
+
+*Demonstration 2: a near-tie, perturbed by realistic floating-point noise, flips the winner entirely.* This is §5.5's actual mechanism, isolated:
+
+```python
+base = torch.tensor([[0.10, 0.40, 0.40, 0.10, 0.05, 0.03, 0.01, 0.01]], device="cuda")
+
+kernel_a = base.clone()
+_, idx_a = ch5.topk_naive(kernel_a, 1)
+
+kernel_b = base.clone()
+kernel_b[0, 1] -= 2e-6   # perturb by ~2 millionths -- entirely ordinary float rounding noise
+kernel_b[0, 2] += 2e-6   # between two different softmax implementations (§5.5)
+_, idx_b = ch5.topk_naive(kernel_b, 1)
+
+print("Kernel A's chosen expert:", idx_a.item())   # index 1
+print("Kernel B's chosen expert:", idx_b.item())   # index 2 -- a completely different expert
+```
+
+`kernel_a` and `kernel_b` differ by two millionths — smaller than the gap you'd see between any two independently-implemented softmax kernels' rounding — and select **entirely different experts**. This is §5.5's bug, reproduced end to end in six lines, with no 24-layer model, no 200-token generation, and no MoE routing infrastructure required: just the exact kernel from this chapter's own source, fed two numbers that any real pair of softmax implementations could plausibly produce for the "same" logits.
+
 ---
 
 ## Hands-On Lab
