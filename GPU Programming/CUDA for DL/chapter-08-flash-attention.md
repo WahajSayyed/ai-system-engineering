@@ -190,6 +190,149 @@ The book's own pointer for where these get addressed, stated directly: *"See fut
 
 **Deep dive: even PyTorch's own 0.087ms has real headroom below it.** It's worth checking PyTorch Flash's own number against a theoretical floor, the same roofline instinct Chapter 1 §1.4.1 built. The *minimum* possible memory traffic for this operation — reading `Q`, `K`, `V` and writing `O` exactly once each, at BF16 (2 bytes/element) — is `4 × (16×8×512×64×2) = 4 × 8,388,608 ≈ 32 MB`. At H100 SXM's confirmed 3.35 TB/s bandwidth, that's a **memory floor of ≈10 microseconds (0.01 ms).** The *compute* side: full attention's two matmuls (`QKᵀ` and `×V`) total `4×B×H×N²×d = 4×16×8×512²×64 ≈ 8.59 GFLOP`; at H100's confirmed 989 TFLOPS dense BF16 tensor-core peak, that's a **compute floor of ≈8.7 microseconds (0.0087 ms).** Both floors land in the same narrow range — this problem size sits almost exactly on H100's roofline ridge point, meaning it's genuinely borderline between memory- and compute-bound rather than clearly one or the other. Either way, **PyTorch's real, measured 0.087ms is roughly 9–10× higher than either theoretical floor** — a useful, humbling data point in its own right: even NVIDIA's own production-grade, CUTLASS-backed implementation isn't operating at the hardware's true limit for this exact problem size, for reasons including kernel-launch overhead and imperfect occupancy at this comparatively modest scale (`N=512` is small by production LLM standards). The 61× gap between `fa.cu` and PyTorch Flash is real and dominant — but it's worth knowing the ceiling itself has some daylight above it too.
 
+## 8.5 Running This from Python: Naive vs. a Simplified Fused Kernel
+
+**A provenance and scope note before the code.** `naive.cu`'s three kernels (§8.2) are quoted verbatim earlier in this chapter and wrap directly. `fa.cu` (§8.3) is more complex than that — its shared-memory tile-loading loop and its P@V WMMA step were both marked as summarized placeholders in the original text (`// (WMMA matmul of Sij_fp16 @ Vj into temp_pv...)`), not fully quoted. Reconstructing WMMA fragment code from an incomplete description, with no GPU in this environment to test it, is exactly the risk Chapter 7 §7.5 declined to take for WGMMA — the same judgment applies here. Instead, below is a **simplified fused kernel** that implements the same core idea in plain CUDA-core arithmetic: one query row per warp, streaming through keys one at a time with online-softmax rescaling, **never materializing more than one score at a time** — no shared-memory Q/K/V tiling, no tensor cores, no batching over `(batch, head)` pairs. It's a genuine, correct flash-attention-style kernel (same recurrence as §8.3's online-softmax update, just applied one key at a time instead of one `Bc`-wide tile at a time), just a smaller and slower one than the book's own.
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ========= Confirmed verbatim, §8.2 =========
+__global__ void naive_qk_matmul_kernel(const float* Q, const float* K, float* S, int N, int d, float scale) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < N && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < d; k++) sum += Q[row*d+k] * K[col*d+k];
+        S[row*N+col] = sum * scale;
+    }
+}
+__global__ void naive_softmax_kernel(float* S, int N) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < N) {
+        float* row_ptr = S + row * N;
+        float max_val = -INFINITY;
+        for (int i = 0; i < N; i++) max_val = fmaxf(max_val, row_ptr[i]);
+        float sum = 0.0f;
+        for (int i = 0; i < N; i++) { row_ptr[i] = expf(row_ptr[i]-max_val); sum += row_ptr[i]; }
+        for (int i = 0; i < N; i++) row_ptr[i] /= sum;
+    }
+}
+__global__ void naive_sv_matmul_kernel(const float* S, const float* V, float* O, int N, int d) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < N && col < d) {
+        float sum = 0.0f;
+        for (int j = 0; j < N; j++) sum += S[row*N+j] * V[j*d+col];
+        O[row*d+col] = sum;
+    }
+}
+
+// ========= Simplified fused kernel: same recurrence as §8.3, one key at a time, no WMMA =========
+__global__ void flash_attn_simple_kernel(const float* Q, const float* K, const float* V, float* O,
+                                          int N, int d, float scale) {
+    int row = blockIdx.x;             // one query row per block
+    int lane = threadIdx.x;           // exactly 32 threads (one warp) cooperate on this row
+    int per_thread = d / 32;          // d must be a multiple of 32 for this minimal demo
+    float o_local[8];                 // supports d up to 256
+    for (int t = 0; t < per_thread; ++t) o_local[t] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+
+    for (int j = 0; j < N; ++j) {
+        float partial = 0.0f;                                   // cooperative Q[row,:] . K[j,:]
+        for (int t = 0; t < per_thread; ++t) {
+            int c = lane * per_thread + t;
+            partial += Q[row*d+c] * K[j*d+c];
+        }
+        for (int o = 16; o > 0; o /= 2) partial += __shfl_down_sync(0xffffffff, partial, o);
+        partial = __shfl_sync(0xffffffff, partial, 0) * scale;   // full dot product, broadcast to all lanes
+
+        float new_m = fmaxf(m, partial);                          // online-softmax update, one key at a time
+        float correction = (m == -INFINITY) ? 0.0f : expf(m - new_m);
+        float p = expf(partial - new_m);
+        l = l * correction + p;
+        for (int t = 0; t < per_thread; ++t) {
+            int c = lane * per_thread + t;
+            o_local[t] = o_local[t] * correction + p * V[j*d+c];   // same rescale-then-accumulate as §8.3
+        }
+        m = new_m;
+    }
+    for (int t = 0; t < per_thread; ++t) {
+        int c = lane * per_thread + t;
+        O[row*d+c] = o_local[t] / l;                               // final normalize, exactly §8.3's Step 4
+    }
+}
+
+// ========= Launchers =========
+torch::Tensor attention_naive(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale) {
+    int N = Q.size(0), d = Q.size(1);
+    auto S = torch::empty({N, N}, Q.options());       // the O(N^2) matrix §8.1 quantifies
+    auto O = torch::empty({N, d}, Q.options());
+    dim3 t2(16,16), g2((N+15)/16,(N+15)/16);
+    naive_qk_matmul_kernel<<<g2,t2>>>(Q.data_ptr<float>(),K.data_ptr<float>(),S.data_ptr<float>(),N,d,(float)scale);
+    int threads=256, blocks=(N+threads-1)/threads;
+    naive_softmax_kernel<<<blocks,threads>>>(S.data_ptr<float>(), N);
+    dim3 t3(16,16), g3((d+15)/16,(N+15)/16);
+    naive_sv_matmul_kernel<<<g3,t3>>>(S.data_ptr<float>(),V.data_ptr<float>(),O.data_ptr<float>(),N,d);
+    return O;
+}
+torch::Tensor attention_fused(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale) {
+    int N = Q.size(0), d = Q.size(1);
+    TORCH_CHECK(d % 32 == 0 && d <= 256, "this minimal demo assumes d is a multiple of 32, up to 256");
+    auto O = torch::empty({N, d}, Q.options());        // no N x N buffer ever allocated
+    flash_attn_simple_kernel<<<N, 32>>>(Q.data_ptr<float>(),K.data_ptr<float>(),V.data_ptr<float>(),O.data_ptr<float>(),N,d,(float)scale);
+    return O;
+}
+"""
+
+cpp_source = r"""
+torch::Tensor attention_naive(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale);
+torch::Tensor attention_fused(torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale);
+"""
+
+ch8 = load_inline(
+    name="ch8_flash_kernels", cpp_sources=cpp_source, cuda_sources=cuda_source,
+    functions=["attention_naive", "attention_fused"], verbose=True,
+)
+```
+
+**Correctness**, against a plain-PyTorch reference (single head, no batching — the same simplification §8.2's own per-head loop makes, just without the outer `(batch, head)` loop around it):
+
+```python
+def attention_reference(Q, K, V, scale):
+    return torch.softmax((Q @ K.t()) * scale, dim=-1) @ V
+
+N, d = 512, 64
+scale = 1.0 / (d ** 0.5)
+Q, K, V = (torch.randn(N, d, device="cuda") for _ in range(3))
+
+O_ref = attention_reference(Q, K, V, scale)
+O_naive = ch8.attention_naive(Q, K, V, scale)
+O_fused = ch8.attention_fused(Q, K, V, scale)
+print("naive max_diff:", (O_naive - O_ref).abs().max().item())
+print("fused max_diff:", (O_fused - O_ref).abs().max().item())
+```
+
+**The memory comparison — this is the number that actually matters for this chapter**, more than raw speed. §8.1's whole argument was about *bytes*, not FLOPs, so measure bytes directly:
+
+```python
+def peak_mem_mb(fn, *args):
+    torch.cuda.reset_peak_memory_stats()
+    fn(*args)
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() / (1024**2)
+
+N_big = 4096   # large enough that the O(N^2) score matrix is impossible to miss
+Qb, Kb, Vb = (torch.randn(N_big, d, device="cuda") for _ in range(3))
+print(f"naive peak memory: {peak_mem_mb(ch8.attention_naive, Qb, Kb, Vb, scale):.1f} MB")
+print(f"fused peak memory: {peak_mem_mb(ch8.attention_fused, Qb, Kb, Vb, scale):.1f} MB")
+```
+
+At `N=4096`, the naive path's `S` matrix alone is `4096×4096×4 bytes = 64 MB` — and that number should show up almost exactly in the naive path's peak-memory figure, while the fused path's peak memory should stay close to just `Q`, `K`, `V`, and `O` themselves (a few MB) — no `N×N` buffer ever gets allocated, because the fused kernel never needs one. That gap, measured directly rather than argued for, is §8.1's "8× more traffic than the real data" point made concrete and literal: not an estimate of bytes moved through HBM, but an actual reported allocation size you can watch scale with `N²` on one side and stay flat on the other.
+
 ---
 
 ## Hands-On Lab

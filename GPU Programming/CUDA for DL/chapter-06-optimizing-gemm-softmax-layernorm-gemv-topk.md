@@ -295,6 +295,284 @@ Observed reduction:            524,288 / 17,024 ≈ 30.8×
 
 The theoretical ceiling from spreading `N` across exactly 32 lanes, with zero merge overhead, would be exactly 32×. The real design lands at **≈30.8×** — within about 4% of that ceiling — meaning the merge stage's cost is genuinely small next to the local-build savings, and this kernel is capturing nearly all of the parallelism this specific axis (splitting `N` across a warp) has to offer. That's a materially different, and much better, story than kernel 2's *tie-breaking* behavior, which — as the paragraph above shows — didn't improve at all along with the speed.
 
+## 6.6 Measuring the Speedups Yourself (with `load_inline`)
+
+This chapter has made a lot of speedup claims backed by the book's own measured tables. This section lets you generate your own numbers, on your own hardware, for all five operations — naive vs. optimized, side by side.
+
+**A provenance note covering all five pairs below, rather than repeating it five times:** the confirmed-verbatim pieces are `warpReduceSum` (§6.3), `warp_reduce_max_with_idx` (§6.5), and the online-softmax rescaling logic (§6.2). Where this chapter quoted a kernel's *structure* in prose rather than its full body (softmax kernel 3's block-level combination stage, layernorm kernel 2's full body, GEMV kernel 2's full body, top-k's block-level extension) — because the original text summarized rather than fully reproduced those sections — I've written **simplified, single-warp completions** below (exactly 32 threads per row, sidestepping the multi-warp block-combination stage the real kernels need for larger thread counts) that implement the *same idea* correctly and unambiguously, rather than risk reconstructing an intricate multi-stage reduction from a partial description. GEMM's tiled kernel is adapted from the book's confirmed FP16 kernel 3 to plain FP32, for a simpler side-by-side comparison against PyTorch.
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ================= GEMM: naive vs. shared-memory tiled (FP32 adaptation of §6.1) =================
+__global__ void gemm_naive_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) sum += A[row*K+k] * B[k*N+col];
+        C[row*N+col] = sum;
+    }
+}
+#define TILE 16
+__global__ void gemm_smem_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    __shared__ float As[TILE][TILE], Bs[TILE][TILE];
+    int row = blockIdx.y * TILE + threadIdx.y, col = blockIdx.x * TILE + threadIdx.x;
+    float sum = 0.0f;
+    for (int t = 0; t < (K + TILE - 1) / TILE; ++t) {
+        As[threadIdx.y][threadIdx.x] = (row < M && t*TILE+threadIdx.x < K) ? A[row*K + t*TILE + threadIdx.x] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] = (col < N && t*TILE+threadIdx.y < K) ? B[(t*TILE+threadIdx.y)*N + col] : 0.0f;
+        __syncthreads();
+        for (int i = 0; i < TILE; ++i) sum += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row*N+col] = sum;
+}
+
+// ================= Softmax: naive (one thread/row) vs. single-warp (§6.2's idea) =================
+__global__ void softmax_naive_kernel(const float* in, float* out, int M, int N) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M) {
+        float m = -INFINITY;
+        for (int i = 0; i < N; ++i) m = fmaxf(m, in[row*N+i]);
+        float s = 0.0f;
+        for (int i = 0; i < N; ++i) s += expf(in[row*N+i]-m);
+        for (int i = 0; i < N; ++i) out[row*N+i] = expf(in[row*N+i]-m) / s;
+    }
+}
+__global__ void softmax_warp32_kernel(const float* in, float* out, int M, int N) {
+    int row = blockIdx.x, lane = threadIdx.x;               // exactly 32 threads (one warp) per row
+    float local_max = -INFINITY, local_norm = 0.0f;
+    for (int i = lane; i < N; i += 32) {                    // online softmax, §6.2's rescaling identity
+        float x = in[row*N+i];
+        if (x > local_max) { local_norm *= expf(local_max - x); local_max = x; }
+        local_norm += expf(x - local_max);
+    }
+    float max_val = local_max;
+    for (int o = 16; o > 0; o /= 2) max_val = fmaxf(max_val, __shfl_down_sync(0xffffffff, max_val, o));
+    max_val = __shfl_sync(0xffffffff, max_val, 0);
+    local_norm *= expf(local_max - max_val);
+    float sum_val = local_norm;
+    for (int o = 16; o > 0; o /= 2) sum_val += __shfl_down_sync(0xffffffff, sum_val, o);
+    sum_val = __shfl_sync(0xffffffff, sum_val, 0);
+    for (int i = lane; i < N; i += 32) out[row*N+i] = expf(in[row*N+i]-max_val) / sum_val;
+}
+
+// ================= LayerNorm: naive (one thread/row) vs. single-warp (§6.3's idea) =================
+__device__ __forceinline__ float warpReduceSum(float val) {   // confirmed verbatim, §6.3
+    for (int offset = 16; offset > 0; offset /= 2) val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+__global__ void layernorm_naive_kernel(const float* x, float* out, int M, int N, float eps) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M) {
+        float mean = 0.0f;
+        for (int i = 0; i < N; ++i) mean += x[row*N+i];
+        mean /= N;
+        float var = 0.0f;
+        for (int i = 0; i < N; ++i) { float d = x[row*N+i]-mean; var += d*d; }
+        var /= N;
+        float rstd = rsqrtf(var + eps);
+        for (int i = 0; i < N; ++i) out[row*N+i] = (x[row*N+i]-mean) * rstd;
+    }
+}
+__global__ void layernorm_warp_kernel(const float* x, float* out, int M, int N, float eps) {
+    int row = blockIdx.x, lane = threadIdx.x;               // exactly 32 threads (one warp) per row
+    float sum = 0.0f;
+    for (int i = lane; i < N; i += 32) sum += x[row*N+i];
+    sum = __shfl_sync(0xffffffff, warpReduceSum(sum), 0);
+    float mean = sum / N;
+    float var_sum = 0.0f;
+    for (int i = lane; i < N; i += 32) { float d = x[row*N+i]-mean; var_sum += d*d; }
+    var_sum = __shfl_sync(0xffffffff, warpReduceSum(var_sum), 0);
+    float rstd = rsqrtf(var_sum/N + eps);
+    for (int i = lane; i < N; i += 32) out[row*N+i] = (x[row*N+i]-mean) * rstd;
+}
+
+// ================= GEMV: naive (one thread/row) vs. single-warp (§6.4's idea) =================
+__global__ void gemv_naive_kernel(const float* A, const float* x, float* y, int M, int N) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M) {
+        float sum = 0.0f;
+        for (int col = 0; col < N; ++col) sum += A[row*N+col] * x[col];
+        y[row] = sum;
+    }
+}
+__global__ void gemv_warp_kernel(const float* A, const float* x, float* y, int M, int N) {
+    int row = blockIdx.x, lane = threadIdx.x;               // one warp (32 threads) per output row
+    float sum = 0.0f;
+    for (int col = lane; col < N; col += 32) sum += A[row*N+col] * x[col];
+    sum = warpReduceSum(sum);
+    if (lane == 0) y[row] = sum;
+}
+
+// ================= Top-K: naive insertion sort (§5.4) vs. single-warp reduction (§6.5's idea) =================
+__global__ void topk_naive_kernel(const float* input, float* values, int* indices, int batch_size, int n, int k) {
+    int b = blockIdx.x;
+    if (b < batch_size) {
+        const float* row = input + b * n;
+        float* vr = values + b * k; int* ir = indices + b * k;
+        for (int i = 0; i < k; ++i) { vr[i] = -INFINITY; ir[i] = -1; }
+        for (int i = 0; i < n; ++i) {
+            float val = row[i];
+            for (int j = 0; j < k; ++j) {
+                if (val > vr[j]) {
+                    for (int m = k-1; m > j; --m) { vr[m]=vr[m-1]; ir[m]=ir[m-1]; }
+                    vr[j] = val; ir[j] = i; break;
+                }
+            }
+        }
+    }
+}
+struct ValueIndex { float value; int index; };
+__device__ __forceinline__ ValueIndex warp_reduce_max_with_idx(ValueIndex val) {   // confirmed verbatim, §6.5
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        ValueIndex other;
+        other.value = __shfl_down_sync(0xffffffff, val.value, offset);
+        other.index = __shfl_down_sync(0xffffffff, val.index, offset);
+        if (other.value > val.value) val = other;
+    }
+    return val;
+}
+__global__ void topk_warp_kernel(const float* input, float* values, int* indices, int batch_size, int n, int k) {
+    int b = blockIdx.x, lane = threadIdx.x;                 // one warp (32 threads) per row
+    if (b >= batch_size) return;
+    const float* row = input + b * n;
+    extern __shared__ float taken[];
+    for (int i = lane; i < n; i += 32) taken[i] = 0.0f;
+    __syncthreads();
+    for (int r = 0; r < k; ++r) {
+        ValueIndex best = {-INFINITY, -1};
+        for (int i = lane; i < n; i += 32)
+            if (taken[i] == 0.0f && row[i] > best.value) { best.value = row[i]; best.index = i; }
+        best = warp_reduce_max_with_idx(best);
+        best.value = __shfl_sync(0xffffffff, best.value, 0);
+        best.index = __shfl_sync(0xffffffff, best.index, 0);
+        if (lane == 0) { values[b*k+r] = best.value; indices[b*k+r] = best.index; taken[best.index] = 1.0f; }
+        __syncthreads();
+    }
+}
+
+// ================= Launchers =================
+torch::Tensor gemm_naive(torch::Tensor A, torch::Tensor B) {
+    int M=A.size(0),K=A.size(1),N=B.size(1); auto C=torch::empty({M,N},A.options());
+    dim3 t(16,16), g((N+15)/16,(M+15)/16);
+    gemm_naive_kernel<<<g,t>>>(A.data_ptr<float>(),B.data_ptr<float>(),C.data_ptr<float>(),M,N,K); return C;
+}
+torch::Tensor gemm_smem(torch::Tensor A, torch::Tensor B) {
+    int M=A.size(0),K=A.size(1),N=B.size(1); auto C=torch::empty({M,N},A.options());
+    dim3 t(TILE,TILE), g((N+TILE-1)/TILE,(M+TILE-1)/TILE);
+    gemm_smem_kernel<<<g,t>>>(A.data_ptr<float>(),B.data_ptr<float>(),C.data_ptr<float>(),M,N,K); return C;
+}
+torch::Tensor softmax_naive(torch::Tensor in) {
+    int M=in.size(0),N=in.size(1); auto out=torch::empty_like(in);
+    int threads=256, blocks=(M+threads-1)/threads;
+    softmax_naive_kernel<<<blocks,threads>>>(in.data_ptr<float>(),out.data_ptr<float>(),M,N); return out;
+}
+torch::Tensor softmax_warp(torch::Tensor in) {
+    int M=in.size(0),N=in.size(1); auto out=torch::empty_like(in);
+    softmax_warp32_kernel<<<M,32>>>(in.data_ptr<float>(),out.data_ptr<float>(),M,N); return out;
+}
+torch::Tensor layernorm_naive(torch::Tensor x, double eps) {
+    int M=x.size(0),N=x.size(1); auto out=torch::empty_like(x);
+    int threads=256, blocks=(M+threads-1)/threads;
+    layernorm_naive_kernel<<<blocks,threads>>>(x.data_ptr<float>(),out.data_ptr<float>(),M,N,(float)eps); return out;
+}
+torch::Tensor layernorm_warp(torch::Tensor x, double eps) {
+    int M=x.size(0),N=x.size(1); auto out=torch::empty_like(x);
+    layernorm_warp_kernel<<<M,32>>>(x.data_ptr<float>(),out.data_ptr<float>(),M,N,(float)eps); return out;
+}
+torch::Tensor gemv_naive(torch::Tensor A, torch::Tensor x) {
+    int M=A.size(0),N=A.size(1); auto y=torch::empty({M},A.options());
+    int threads=256, blocks=(M+threads-1)/threads;
+    gemv_naive_kernel<<<blocks,threads>>>(A.data_ptr<float>(),x.data_ptr<float>(),y.data_ptr<float>(),M,N); return y;
+}
+torch::Tensor gemv_warp(torch::Tensor A, torch::Tensor x) {
+    int M=A.size(0),N=A.size(1); auto y=torch::empty({M},A.options());
+    gemv_warp_kernel<<<M,32>>>(A.data_ptr<float>(),x.data_ptr<float>(),y.data_ptr<float>(),M,N); return y;
+}
+std::vector<torch::Tensor> topk_naive(torch::Tensor in, int64_t k) {
+    int B=in.size(0),n=in.size(1);
+    auto v=torch::empty({B,k},in.options()), idx=torch::empty({B,k},in.options().dtype(torch::kInt32));
+    topk_naive_kernel<<<B,1>>>(in.data_ptr<float>(),v.data_ptr<float>(),idx.data_ptr<int>(),B,n,(int)k);
+    return {v, idx};
+}
+std::vector<torch::Tensor> topk_warp(torch::Tensor in, int64_t k) {
+    int B=in.size(0),n=in.size(1);
+    auto v=torch::empty({B,k},in.options()), idx=torch::empty({B,k},in.options().dtype(torch::kInt32));
+    topk_warp_kernel<<<B,32,n*sizeof(float)>>>(in.data_ptr<float>(),v.data_ptr<float>(),idx.data_ptr<int>(),B,n,(int)k);
+    return {v, idx};
+}
+"""
+
+cpp_source = r"""
+torch::Tensor gemm_naive(torch::Tensor A, torch::Tensor B);
+torch::Tensor gemm_smem(torch::Tensor A, torch::Tensor B);
+torch::Tensor softmax_naive(torch::Tensor in);
+torch::Tensor softmax_warp(torch::Tensor in);
+torch::Tensor layernorm_naive(torch::Tensor x, double eps);
+torch::Tensor layernorm_warp(torch::Tensor x, double eps);
+torch::Tensor gemv_naive(torch::Tensor A, torch::Tensor x);
+torch::Tensor gemv_warp(torch::Tensor A, torch::Tensor x);
+std::vector<torch::Tensor> topk_naive(torch::Tensor in, int64_t k);
+std::vector<torch::Tensor> topk_warp(torch::Tensor in, int64_t k);
+"""
+
+ch6 = load_inline(
+    name="ch6_optim_kernels", cpp_sources=cpp_source, cuda_sources=cuda_source,
+    functions=["gemm_naive", "gemm_smem", "softmax_naive", "softmax_warp",
+               "layernorm_naive", "layernorm_warp", "gemv_naive", "gemv_warp",
+               "topk_naive", "topk_warp"],
+    verbose=True,
+)
+```
+
+A single benchmarking harness — CUDA events (Chapter 2 §2.6), correctness first, then timing — run against all five pairs:
+
+```python
+def bench(fn, *args, iters=50):
+    for _ in range(5): fn(*args)                     # warmup
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters): fn(*args)
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters            # ms per call
+
+def compare(name, naive_fn, opt_fn, *args, atol=1e-3):
+    out_naive = naive_fn(*args); out_opt = opt_fn(*args)
+    diff = (out_naive - out_opt).abs().max().item()
+    t_naive, t_opt = bench(naive_fn, *args), bench(opt_fn, *args)
+    print(f"{name:10s} match={diff:.1e}  naive={t_naive:.3f}ms  optimized={t_opt:.3f}ms  speedup={t_naive/t_opt:.1f}x")
+
+device = "cuda"
+torch.manual_seed(0)
+
+A, B = torch.randn(1024, 512, device=device), torch.randn(512, 1024, device=device)
+compare("gemm", ch6.gemm_naive, ch6.gemm_smem, A, B)
+
+S = torch.randn(256, 4096, device=device)
+compare("softmax", ch6.softmax_naive, ch6.softmax_warp, S)
+
+X = torch.randn(256, 4096, device=device)
+compare("layernorm", lambda x: ch6.layernorm_naive(x, 1e-5), lambda x: ch6.layernorm_warp(x, 1e-5), X)
+
+Amat, xvec = torch.randn(4096, 4096, device=device), torch.randn(4096, device=device)
+compare("gemv", ch6.gemv_naive, ch6.gemv_warp, Amat, xvec)
+
+R = torch.randn(256, 4096, device=device)
+def tk_naive(r): return ch6.topk_naive(r, 8)[0]
+def tk_warp(r):  return ch6.topk_warp(r, 8)[0]
+compare("topk", tk_naive, tk_warp, R)
+```
+
+Every row should show `match` near zero and a real `speedup` greater than 1×. Note `layernorm` here omits the learned affine (gamma/beta) parameters real `nn.LayerNorm` applies — this demo compares two raw normalization kernels against each other, not against PyTorch's own layer, so that's an intentional simplification, not a discrepancy to chase. Your own numbers won't match the book's H100 table exactly — these are simplified, single-warp, FP32 reproductions on whatever GPU you're running, not the book's tuned FP16/multi-warp kernels — but the *shape* of the result (naive loses, cooperative reduction wins, by a real and repeatable margin) should hold on your RTX 3090 and T4 alike.
+
 ---
 
 ## Hands-On Lab

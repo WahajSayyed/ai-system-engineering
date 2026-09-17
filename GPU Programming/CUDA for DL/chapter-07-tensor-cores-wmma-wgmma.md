@@ -196,6 +196,97 @@ One more real, concrete number worth sitting with: correctness validation across
 
 **Deep dive: what the mismeasurement actually cost, in perceived-value terms.** It's worth translating "~106 TFLOPS vs. ~550 TFLOPS" into the language the rest of this table uses — speedup over naive. Against naive's confirmed 0.5 TFLOPS, the flawed measurement would have reported roughly `106/0.5 ≈ 212×` speedup for a kernel that had, in reality, already implemented every advanced technique this chapter covers. The corrected measurement puts the true figure at `550/0.5 = 1,100×`. **The bug didn't just understate the number — it hid more than half of the kernel's true achievement**, making a kernel that had already earned a place at the top of this chapter's own performance table look barely better than plain WMMA (142×, from §7.1's table) instead of nearly 8× better than WMMA. That gap between "barely ahead of the easy option" and "a legitimate contender near the top of the ladder" is entirely a measurement artifact — the kernel itself never changed.
 
+## 7.5 Running WMMA from Python (and Why WGMMA Can't, Here)
+
+**Honesty check before any code:** this environment has no attached GPU, so nothing in this course's Python sections has actually been executed and observed by me — every one has been written and hand-traced carefully, not run. That's always been true; it matters more to say out loud in this specific chapter, because §7.3's WGMMA kernels have a stronger claim than usual: they *cannot run at all* outside Hopper, a limitation this section needs to respect rather than paper over with code that would merely fail to compile if you tried it.
+
+**WMMA, first — this genuinely runs on both your GPUs.** §7.2's real kernel uses a full block/warp/fragment tiling hierarchy whose shared-memory loading loop wasn't fully quoted verbatim (the text marks it `// ...vectorized int4 loads...` as a summarized placeholder, not literal source). Rather than reconstruct that hierarchy's exact details from a partial description, here's a **minimal, single-warp-per-tile WMMA kernel** — smaller in scope than the book's own, but using the *exact same confirmed API calls* (`load_matrix_sync`, `mma_sync`, `store_matrix_sync`) in the simplest form they can take:
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+using namespace nvcuda;
+
+// One warp computes one 16x16 output tile, looping over K in chunks of 16.
+// Simplified relative to §7.2's full hierarchy (one warp per tile, not a
+// block/warp/fragment hierarchy) -- but the four WMMA API calls themselves
+// are used exactly as §7.2 describes them.
+__global__ void wmma_gemm_kernel(const half* A, const half* B, float* C, int M, int N, int K) {
+    int warpM = blockIdx.y * blockDim.y + threadIdx.y;   // which 16-row tile of C this warp owns
+    int warpN = blockIdx.x;                               // which 16-col tile of C this block owns
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    for (int k = 0; k < K; k += 16) {
+        int aRow = warpM * 16, bCol = warpN * 16;
+        wmma::load_matrix_sync(a_frag, A + aRow * K + k, K);
+        wmma::load_matrix_sync(b_frag, B + k * N + bCol, N);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    wmma::store_matrix_sync(C + (warpM * 16) * N + warpN * 16, c_frag, N, wmma::mem_row_major);
+}
+
+torch::Tensor wmma_gemm(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.dtype() == torch::kFloat16 && B.dtype() == torch::kFloat16, "inputs must be FP16");
+    int M = A.size(0), K = A.size(1), N = B.size(1);
+    TORCH_CHECK(M % 16 == 0 && N % 16 == 0 && K % 16 == 0, "M, N, K must be multiples of 16 for this minimal demo");
+    auto C = torch::empty({M, N}, A.options().dtype(torch::kFloat32));
+    dim3 threads(32, 4);                        // 4 warps/block, one warp per 16-row tile via threadIdx.y
+    dim3 blocks(N / 16, (M / 16 + 3) / 4);
+    wmma_gemm_kernel<<<blocks, threads>>>(
+        reinterpret_cast<half*>(A.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(B.data_ptr<at::Half>()),
+        C.data_ptr<float>(), M, N, K);
+    return C;
+}
+"""
+
+cpp_source = "torch::Tensor wmma_gemm(torch::Tensor A, torch::Tensor B);"
+
+ch7 = load_inline(
+    name="ch7_wmma_kernel", cpp_sources=cpp_source, cuda_sources=cuda_source,
+    functions=["wmma_gemm"], verbose=True,
+)
+
+M, K, N = 256, 256, 256
+A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+
+C_custom = ch7.wmma_gemm(A, B)
+C_ref = (A.float() @ B.float())    # FP32 reference -- WMMA accumulates in FP32 internally (§7.2)
+print("max diff:", (C_custom - C_ref).abs().max().item())   # expect a small but nonzero FP16-input diff
+```
+
+This should build and run on **both** your GPUs — Ampere and Turing alike support WMMA (Volta+, per §7.1's hardware table). It's a genuinely smaller kernel than the book's own (no boundary handling for non-multiples of 16, no register/warp tiling beyond one warp per 16×16 tile), but it exercises the real hardware path — you can confirm this yourself by timing it against `A.float() @ B.float()` (plain CUDA cores) and `A.half() @ B.half()` (cuBLAS with tensor cores, PyTorch's own default for FP16 matmul) the same way §7.1's table compares kernels 6, 7, and 0.
+
+**WGMMA — why this section stops at the kernel text, not a runnable wrapper.** Three real constraints compound here, worth naming rather than working around: (1) `wgmma.mma_async` is a Hopper-only PTX instruction — trying to compile it for your 3090's `sm_86` fails at compile time, exactly as the Hands-On Lab already demonstrated; (2) even setting that aside, §7.3's quoted source stops short of a complete kernel — the inline PTX asm's full 32-register output list and `make_smem_desc`'s exact bit-packing weren't fully reproduced, only described; (3) with no GPU in this environment, I have no way to actually compile or test a from-scratch reconstruction even if I attempted one. Writing code I can't verify, to run on hardware neither of us has access to right now, for a kernel I don't have complete confirmed source for, would stack three separate honesty problems on top of each other.
+
+What *is* worth showing: how you'd point `load_inline` at Hopper if you had a complete WGMMA kernel to compile, since the mechanism itself is simple and worth knowing on its own —
+
+```python
+# Illustrative only -- assumes you've supplied a complete WGMMA kernel's source
+# (this chapter's confirmed fence/commit/wait helpers plus the full register layout
+# and TMA descriptor code that §7.3 summarizes but doesn't fully reproduce).
+ch7_hopper = load_inline(
+    name="ch7_wgmma_kernel",
+    cpp_sources="torch::Tensor wgmma_gemm(torch::Tensor A, torch::Tensor B);",
+    cuda_sources=your_complete_wgmma_source,   # not provided here -- see below
+    functions=["wgmma_gemm"],
+    extra_cuda_cflags=["-arch=sm_90a"],         # the exact flag from this chapter's own Makefile (§7.1)
+    verbose=True,
+)
+```
+
+For the real kernel, the right move is the one the book itself sets up: clone `book.cu/5_tensor_cores`, and on an actual H100 (rented, if needed — this is this course's flagged cloud-GPU chapter), `make ARCH=sm_90a && python main.py`. That gets you the complete, tested kernel this section can't safely reconstruct from a partial quote.
+
 ---
 
 ## Hands-On Lab

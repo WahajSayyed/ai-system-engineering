@@ -255,6 +255,213 @@ Trace the effect through: a **large-magnitude activation** gets a **small** scal
 
 **Deep dive: the specific failure mode this scheme exists to prevent.** `matmul_naive_quant_kernel` rounds `W×7` directly, with no scale factor at all — meaning any weight smaller in magnitude than `1/14 ≈ 0.071` rounds to exactly **zero**, regardless of what it's multiplied against. A weight of `0.05` paired with an activation of `25.0` (this file's own largest input value) contributes `0.05 × 25.0 = 1.25` to the true output — genuinely significant — but vanishes to `0 × 25.0 = 0` under naive quantization, a **100% loss** of that term. AWQ's per-channel rescaling directly targets this: by dividing that same `0.05` weight by a *small* scale (since it's paired with a large activation), the value going into the rounding step is pushed well away from zero before rounding ever happens, so it survives instead of disappearing. This is the concrete, worst-case version of the "protects large-activation weights" mechanism described above — it's not just that those weights get *somewhat* better relative precision, it's that without this scheme, some of them would be thrown away entirely.
 
+## 9.8 Verifying the Deep-Dive Predictions from Python
+
+The deep dives above made several specific, falsifiable numeric predictions — the `Δ²/12` match, the ~329× INT4-vs-INT8 ratio, the ~4× symmetric-vs-asymmetric ratio. This section wraps the confirmed kernels via `load_inline` so you can check every one of them yourself, plus **run the two real bugs from §9.5 live** rather than just reading about them.
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ========= §9.1: FP32 <-> INT8, confirmed verbatim =========
+__global__ void quantize_int8_kernel(const float* input, int8_t* output, float scale, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float s = fmaxf(fminf(input[idx] / scale, 127.0f), -127.0f);
+    output[idx] = (int8_t)roundf(s);
+}
+__global__ void dequantize_int8_kernel(const int8_t* input, float* output, float scale, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    output[idx] = (float)input[idx] * scale;
+}
+
+// ========= §9.2: FP32 <-> packed INT4, confirmed verbatim =========
+__global__ void quantize_int4_packed_kernel(const float* input, uint8_t* output, float scale, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size + 1) / 2) return;
+    int e1 = idx * 2, e2 = idx * 2 + 1;
+    int8_t q1 = (int8_t)roundf(fmaxf(fminf(input[e1] / scale, 7.0f), -7.0f));
+    int8_t q2 = 0;
+    if (e2 < size) q2 = (int8_t)roundf(fmaxf(fminf(input[e2] / scale, 7.0f), -7.0f));
+    output[idx] = ((q1 & 0x0F) << 4) | (q2 & 0x0F);
+}
+__global__ void dequantize_int4_packed_kernel(const uint8_t* input, float* output, float scale, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size + 1) / 2) return;
+    uint8_t packed = input[idx];
+    int8_t q1 = (packed >> 4), q2 = packed & 0x0F;
+    if (q1 & 0x08) q1 |= 0xF0;                    // sign extension -- §9.2's real bug class if omitted
+    if (q2 & 0x08) q2 |= 0xF0;
+    int e1 = idx * 2, e2 = idx * 2 + 1;
+    output[e1] = (float)q1 * scale;
+    if (e2 < size) output[e2] = (float)q2 * scale;
+}
+
+// ========= §9.3: symmetric vs. asymmetric, confirmed verbatim =========
+__global__ void quantize_asymmetric_kernel(const float* input, uint8_t* output, float scale, float zp, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float s = roundf(input[idx] / scale) + zp;
+    output[idx] = (uint8_t)fmaxf(fminf(s, 255.0f), 0.0f);
+}
+__global__ void dequantize_asymmetric_kernel(const uint8_t* input, float* output, float scale, float zp, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    output[idx] = ((float)input[idx] - zp) * scale;
+}
+
+// ========= §9.5: the two calibration kernels, bugs included, confirmed verbatim =========
+__global__ void calibrate_min_max_kernel(const float* data, float* scale_out, float* zp_out, int size) {
+    extern __shared__ float sdata_min_max[];
+    int tid = threadIdx.x, idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = (idx < size) ? data[idx] : 0.0f;
+    if (tid == 0) { sdata_min_max[0] = val; sdata_min_max[1] = val; }
+    __syncthreads();
+    atomicMin((int*)&sdata_min_max[0], __float_as_int(val));
+    atomicMax((int*)&sdata_min_max[1], __float_as_int(val));
+    __syncthreads();
+    if (tid == 0 && blockIdx.x == 0) {              // <-- confirmed bug: only block 0's result is ever used
+        float min_val = sdata_min_max[0], max_val = sdata_min_max[1];
+        float range = max_val - min_val;
+        if (range > 1e-6f) { *scale_out = range / 255.0f; *zp_out = -min_val / *scale_out; }
+        else { *scale_out = 1.0f; *zp_out = 0.0f; }
+    }
+}
+
+// ========= Launchers =========
+torch::Tensor quantize_int8(torch::Tensor input, double scale) {
+    int n = input.numel(); auto out = torch::empty({n}, input.options().dtype(torch::kInt8));
+    int t=256, b=(n+t-1)/t;
+    quantize_int8_kernel<<<b,t>>>(input.data_ptr<float>(), out.data_ptr<int8_t>(), (float)scale, n);
+    return out;
+}
+torch::Tensor dequantize_int8(torch::Tensor input, double scale) {
+    int n = input.numel(); auto out = torch::empty({n}, input.options().dtype(torch::kFloat32));
+    int t=256, b=(n+t-1)/t;
+    dequantize_int8_kernel<<<b,t>>>(input.data_ptr<int8_t>(), out.data_ptr<float>(), (float)scale, n);
+    return out;
+}
+torch::Tensor quantize_int4(torch::Tensor input, double scale) {
+    int n = input.numel(), p = (n+1)/2; auto out = torch::empty({p}, input.options().dtype(torch::kUInt8));
+    int t=256, b=(p+t-1)/t;
+    quantize_int4_packed_kernel<<<b,t>>>(input.data_ptr<float>(), out.data_ptr<uint8_t>(), (float)scale, n);
+    return out;
+}
+torch::Tensor dequantize_int4(torch::Tensor input, int64_t n, double scale) {
+    auto out = torch::empty({n}, input.options().dtype(torch::kFloat32));
+    int p = (n+1)/2, t=256, b=(p+t-1)/t;
+    dequantize_int4_packed_kernel<<<b,t>>>(input.data_ptr<uint8_t>(), out.data_ptr<float>(), (float)scale, (int)n);
+    return out;
+}
+torch::Tensor quantize_asym(torch::Tensor input, double scale, double zp) {
+    int n = input.numel(); auto out = torch::empty({n}, input.options().dtype(torch::kUInt8));
+    int t=256, b=(n+t-1)/t;
+    quantize_asymmetric_kernel<<<b,t>>>(input.data_ptr<float>(), out.data_ptr<uint8_t>(), (float)scale, (float)zp, n);
+    return out;
+}
+torch::Tensor dequantize_asym(torch::Tensor input, double scale, double zp) {
+    int n = input.numel(); auto out = torch::empty({n}, input.options().dtype(torch::kFloat32));
+    int t=256, b=(n+t-1)/t;
+    dequantize_asymmetric_kernel<<<b,t>>>(input.data_ptr<uint8_t>(), out.data_ptr<float>(), (float)scale, (float)zp, n);
+    return out;
+}
+std::vector<torch::Tensor> calibrate_min_max(torch::Tensor data, int64_t threads_per_block) {
+    int n = data.numel();
+    auto scale_out = torch::zeros({1}, data.options()), zp_out = torch::zeros({1}, data.options());
+    int blocks = (n + threads_per_block - 1) / threads_per_block;
+    calibrate_min_max_kernel<<<blocks, threads_per_block, 2*sizeof(float)>>>(
+        data.data_ptr<float>(), scale_out.data_ptr<float>(), zp_out.data_ptr<float>(), n);
+    return {scale_out, zp_out};
+}
+"""
+
+cpp_source = r"""
+torch::Tensor quantize_int8(torch::Tensor input, double scale);
+torch::Tensor dequantize_int8(torch::Tensor input, double scale);
+torch::Tensor quantize_int4(torch::Tensor input, double scale);
+torch::Tensor dequantize_int4(torch::Tensor input, int64_t n, double scale);
+torch::Tensor quantize_asym(torch::Tensor input, double scale, double zp);
+torch::Tensor dequantize_asym(torch::Tensor input, double scale, double zp);
+std::vector<torch::Tensor> calibrate_min_max(torch::Tensor data, int64_t threads_per_block);
+"""
+
+ch9 = load_inline(
+    name="ch9_quant_kernels", cpp_sources=cpp_source, cuda_sources=cuda_source,
+    functions=["quantize_int8", "dequantize_int8", "quantize_int4", "dequantize_int4",
+               "quantize_asym", "dequantize_asym", "calibrate_min_max"],
+    verbose=True,
+)
+```
+
+**Verifying `Δ²/12` (§9.1) and the ~329× INT4 ratio (§9.2) in one script:**
+
+```python
+torch.manual_seed(0)
+n = 1_000_000
+data = torch.randn(n, device="cuda") * 2.0        # matches this chapter's own mean-0, std-2 test data
+
+scale8 = data.abs().max().item() / 127.0
+dq8 = ch9.dequantize_int8(ch9.quantize_int8(data, scale8), scale8)
+mse8 = ((data - dq8) ** 2).mean().item()
+print(f"INT8:  scale={scale8:.6f}  measured MSE={mse8:.6e}  predicted Δ²/12={scale8**2/12:.6e}")
+
+scale4 = data.abs().max().item() / 7.0
+dq4 = ch9.dequantize_int4(ch9.quantize_int4(data, scale4), n, scale4)
+mse4 = ((data - dq4) ** 2).mean().item()
+print(f"INT4:  scale={scale4:.6f}  measured MSE={mse4:.6e}  predicted Δ²/12={scale4**2/12:.6e}")
+print(f"INT4/INT8 MSE ratio: {mse4/mse8:.1f}x  (§9.2 predicted ≈329x)")
+```
+
+**Verifying the ~4× symmetric-vs-asymmetric ratio on genuinely non-negative data (§9.3):**
+
+```python
+relu_data = torch.relu(torch.randn(n, device="cuda") * 2.0)     # non-negative, like post-ReLU activations
+
+scale_sym = relu_data.abs().max().item() / 127.0
+dq_sym = ch9.dequantize_int8(ch9.quantize_int8(relu_data, scale_sym), scale_sym)
+mse_sym = ((relu_data - dq_sym) ** 2).mean().item()
+
+r_min, r_max = relu_data.min().item(), relu_data.max().item()
+scale_asym = (r_max - r_min) / 255.0
+zp_asym = -r_min / scale_asym
+dq_asym = ch9.dequantize_asym(ch9.quantize_asym(relu_data, scale_asym, zp_asym), scale_asym, zp_asym)
+mse_asym = ((relu_data - dq_asym) ** 2).mean().item()
+
+print(f"symmetric MSE={mse_sym:.6e}  asymmetric MSE={mse_asym:.6e}  ratio={mse_sym/mse_asym:.2f}x  (§9.3 predicted ≈4x)")
+```
+
+**Running the multi-block calibration bug live (§9.5):**
+
+```python
+data2 = torch.randn(100_000, device="cuda")
+true_min, true_max = data2.min().item(), data2.max().item()
+
+scale_1block, _ = ch9.calibrate_min_max(data2, 100_000)   # one block covers everything -- no bug triggered
+scale_multi, _  = ch9.calibrate_min_max(data2, 256)        # forces ~400 blocks -- triggers the bug
+
+print(f"true data range: [{true_min:.4f}, {true_max:.4f}]")
+print(f"single-block calibration: scale={scale_1block.item():.6f}")
+print(f"multi-block  calibration: scale={scale_multi.item():.6f}   <- based on ~256 of 100,000 elements only")
+```
+
+`scale_multi` should come out visibly smaller than `scale_1block` — with only 256 of 100,000 elements ever actually considered (whichever ones landed in block 0), the true tail values almost certainly aren't among them, so the computed range understates the real one. This is the self-acknowledged bug from §9.5, triggered on demand rather than taken on faith.
+
+**Testing for the signed-float atomic issue (§9.5's second catch) — honestly, without assuming the outcome:**
+
+```python
+data3 = torch.tensor([-5.0, -1.0, 0.5, 2.0], device="cuda")
+scale3, zp3 = ch9.calibrate_min_max(data3, 4)     # one block -- isolates this from the multi-block bug above
+implied_min = -zp3.item() * scale3.item()
+print(f"true min: -5.0    kernel's implied min: {implied_min:.4f}")
+```
+
+Unlike the predictions above, this one I genuinely can't tell you the outcome of without running it — whether `atomicMin` on signed-float bit patterns misorders *this specific* set of values depends on the exact bits involved, not just on "there are negative numbers present." If `implied_min` disagrees with `-5.0`, you've directly observed the ordering issue described in §9.5; if this particular array happens not to trigger it, that's consistent with the bug being real but data-dependent — try a few other negative-heavy arrays and see whether one does.
+
 ---
 
 ## Hands-On Lab

@@ -1,0 +1,72 @@
+# Chapter 19 — Group GEMM & Persistent Kernels
+
+## 19.1 Two Related Problems, One Mechanism
+
+This chapter solves two problems that turn out to share a single underlying technique. First: **persistent kernels for an ordinary, single matmul** — formalizing the grid-stride pattern you first previewed by hand in Chapter 3, §3.6, and saw used for a real reason in Chapter 7's occupancy-driven softmax, now applied to Chapter 9's matmul specifically. Second, and building directly on the first: **group GEMM** — batching *multiple, differently-shaped* matmul problems into a single kernel launch, the technique behind efficiently implementing Mixture-of-Experts (MoE) layers, where each "expert" has its own weight matrix and receives a genuinely different, data-dependent number of tokens. The mechanism connecting them: a persistent kernel, launched with a fixed number of programs, that strides through a pool of tile-shaped work — whether that pool is one matmul's tiles or many differently-shaped matmuls' tiles combined.
+
+## 19.2 Persistent Matmul: Chapters 3 and 9, Combined
+
+Recall the grid-stride idiom from Chapter 3, §3.6, and Chapter 9's grouped tile-ordering formula (`_compute_pid`, computing `pid_m`/`pid_n` from a linear tile index via the L2-aware grouping scheme). The persistent matmul kernel is, almost literally, these two pieces combined:
+
+```python
+for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=FLATTEN, warp_specialize=WARP_SPECIALIZE):
+    pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS)
+    # ... load A/B tiles, accumulate via tl.dot, exactly as in Chapter 9 ...
+```
+
+The launch grid is sized to **exactly `NUM_SMS`** programs — the physical SM count of the target GPU — rather than one program per output tile. `num_tiles` (the total tile-work the whole matmul requires) is almost always far larger than `NUM_SMS`; each of the `NUM_SMS` programs strides through the tile-index space in steps of `NUM_SMS`, computing multiple output tiles over its lifetime rather than exiting after one. This is precisely the grid-stride pattern from Chapter 3 — you're seeing its mature, load-bearing form now, rather than the illustrative toy version from that earlier chapter. And `_compute_pid` inside the loop is the *exact same* grouped-ordering function from Chapter 9 — persistent scheduling and L2-aware tile ordering are complementary, not competing, optimizations, and this kernel uses both simultaneously.
+
+Also worth recognizing: `tl.range`'s `flatten` and `warp_specialize` keyword arguments — introduced somewhat abstractly back in Chapter 6, §6.4, as compiler-facing hints you hadn't yet seen used for real — appear here doing genuine work in current, real Triton source. `warp_specialize` is your first direct sighting of the mechanism Chapter 25 covers in full.
+
+## 19.3 Why Persistent Scheduling Helps Matmul, Specifically: Three Distinct Reasons
+
+It's worth being precise about *three separate* benefits, since they're often bundled together loosely as "persistent kernels are faster" without distinguishing which mechanism is actually responsible in a given case:
+
+1. **Reduced launch overhead** — fewer program instances launched for the same total amount of tile-work, exactly the rationale Chapter 7's occupancy-driven softmax design already established.
+2. **Improved cache reuse through temporal locality** — (cite index="53-1">re-ordering the launch/scheduling of programs so that tiles are computed in an order that allows better reuse of recently-touched data, improving L2 cache hit rates</cite>. A tile processed by a *specific, already-warm* SM immediately after a related tile (rather than by whichever SM the hardware scheduler happens to assign a fresh CTA to, with no guaranteed relationship to what ran there before) is more likely to find useful data still resident in that SM's local cache.
+3. **Reduced scheduling imbalance (the "tail effect")** — (cite index="53-1">in a naive scheme, a new thread block is launched for every tile of work; persistent kernels instead keep programs alive and dynamically feed them new tiles until all the work is done, avoiding launch overhead, improving cache reuse, and — critically — reducing scheduling imbalance</cite>. This third benefit is the one worth sitting with: if tiles carry wildly uneven amounts of work, a naive one-CTA-per-tile launch can leave many SMs idle, waiting, while a handful of disproportionately expensive tiles are still being processed elsewhere — total kernel time is bounded by the *slowest* tile's SM, not the average. A persistent, dynamically-fed scheduling scheme lets an SM that finishes its current tile immediately pick up more of the remaining work, rather than sitting idle. This benefit is modest for an ordinary, uniform matmul (Chapter 9's tiles are all roughly equal work) — and becomes essential for §19.4's actual subject.
+
+## 19.4 Group GEMM: Batching Genuinely Different-Shaped Problems
+
+Here's the motivating real-world case where reason 3 above stops being a minor nicety and becomes the whole point. In a Mixture-of-Experts layer, you have `G` separate experts, each with its own weight matrix, and a **data-dependent, genuinely unequal** number of tokens routed to each expert — you don't know these counts until the routing decision has actually been made at runtime, and they can differ enormously between experts. Naively, you'd run `G` separate matmul kernel launches, one per expert — paying `G`-times the launch overhead, and getting no scheduling coordination whatsoever between them (an SM that finishes a small expert's work early has no way to help with a much larger expert's remaining tiles, since that's a *separate kernel launch* the hardware scheduler has no visibility into as related work).
+
+**Group GEMM fuses all `G` matmul problems into a single kernel launch**, using the exact same persistent mechanism from §19.2 — but now striding through a *combined, heterogeneous* pool of tiles spanning every group, rather than one uniform matmul's tiles. A small bookkeeping structure (typically a cumulative tile-count lookup) maps a single, global, linear tile index back to "which group this tile belongs to, and which `(pid_m, pid_n)` within that group's own local tiling scheme." Every other mechanic — the `tl.dot` accumulation loop, the masking, the output store — is exactly Chapter 9's matmul kernel, just parameterized per-group rather than assuming one fixed `(M, N, K)` for the whole launch.
+
+**This is precisely where §19.3's third benefit becomes essential rather than incidental.** With genuinely unequal, data-dependent group sizes, a naive per-group launch scheme is exactly the pathological case the tail-effect problem describes — some SMs would finish a small expert's tiles quickly and then sit completely idle while a handful of SMs grind through a much larger expert's remaining tiles. A persistent, dynamically-fed kernel spanning *all* groups lets every SM keep pulling more work — from whichever group still has tiles remaining — until the entire combined problem is done, directly eliminating the idle-SM tail.
+
+**This also generalizes Chapter 9's own L2-locality lesson, one level up.** Chapter 9 used grouped tile *ordering* to improve L2 reuse *within* a single GEMM's own M/N grid. Group GEMM's grouped *launch schedule* does something structurally analogous *across* the multiple, differently-shaped GEMMs sharing one kernel launch: (cite index="53-1">re-ordering which tiles get computed when, so that input activations and expert weights are reused across nearby tiles, improving L2 hit rates, increasing arithmetic intensity, and reducing kernel latency</cite>. Same underlying principle (spatial/temporal locality in what nearby SMs are working on), applied at a larger scope.
+
+## 19.5 A Note on TMA's Role Here
+
+Production group GEMM kernels (particularly for MoE, where expert weight matrices can be large) commonly pair this scheduling strategy with tensor descriptors (Chapter 5) for loading expert weights, for a reason slightly different from what Chapter 5 originally emphasized: (cite index="53-1">the TMA hardware unit can free up SM resources — registers and CUDA cores — while data is being moved from global to shared memory</cite>, since the copy happens asynchronously via a dedicated hardware unit rather than consuming the SM's own compute/register resources to drive it. Chapter 5 introduced TMA primarily as a faster addressing mechanism; here, the emphasis is on **resource freeing** — while one tile's weights are being fetched, the SM's compute resources are genuinely free to work on something else, which matters enormously when you're trying to keep every SM saturated with useful work across a heterogeneous pool of tiles. Full warp-specialized use of this is Chapter 25's subject — treat this as a motivating preview.
+
+## 19.6 A Related Technique, Briefly: Epilogue Subtiling
+
+Worth knowing exists, even without deriving it in full: **epilogue subtiling** breaks a matmul kernel's final stage — converting the accumulator to the output dtype and storing it — into smaller pieces, specifically to reduce how much shared memory that final stage needs, freeing that memory to be spent on **deeper software pipelining** (a larger `num_stages`) instead. This is a genuine, concrete instance of the shared-memory-budget-is-finite theme from Chapter 15 — the interesting decision isn't just "how much shared memory does this kernel use," it's "which of several competing purposes (staging `tl.dot` operands, pipelining depth, the epilogue) is a fixed shared-memory budget best spent on," and epilogue subtiling is one lever for shifting that allocation.
+
+## 19.7 An Honest Note: This Is Still an Active Area of Development
+
+Group GEMM performance engineering is not a fully solved, copy-and-done topic — worth knowing before you assume a reference implementation represents a final answer. A real, documented challenge: group GEMM kernels naturally nest **three** loops — over groups, over output tiles within a group, and over the `K`-dimension reduction within a tile — and (cite index="49-1">by default, only the innermost of these three loops is actually software-pipelined by the compiler, which can introduce real pipeline bubbles; achieving deeper, cross-loop pipelining currently requires manually fusing the loops together into one combined loop, structured similarly to the persistent matmul pattern from §19.2</cite>. This is genuinely current, open engineering work, not a solved problem you're expected to already know the final answer to — consistent with several other places in this curriculum (Chapter 15's shared-memory-spilling CUDA feature, Chapter 16's linear-layout transition) where the honest state of the art is "actively improving," not "finished."
+
+## 19.8 Hands-On
+
+**Exercise 1 — Make Chapter 9's matmul persistent.** Take your autotuned matmul kernel and `_compute_pid` function from Chapter 9, and wrap the tile loop in the `tl.range(start_pid, num_tiles, NUM_SMS, ...)` persistent pattern from §19.2, launching exactly `NUM_SMS` programs instead of one per tile. Confirm correctness is unaffected, then benchmark launch-overhead savings specifically at a problem size producing *many* small tiles (where per-launch overhead is a larger fraction of total kernel time).
+
+**Exercise 2 — A basic group GEMM.** Implement a group GEMM kernel for a small number of groups (e.g., `G=4`), with deliberately unequal `(M, N, K)` per group (make one group substantially larger than the others, simulating uneven MoE expert routing), using the cross-group persistent tile-index scheme from §19.4. Test correctness against `G` separate `torch.matmul` calls.
+
+**Exercise 3 — Quantify the tail-effect benefit directly.** Compare your group GEMM kernel against the naive alternative — `G` separate, ordinary Chapter-9-style matmul kernel launches, back to back — specifically at a deliberately imbalanced group-size distribution (one large group, several small ones). Quantify the benefit §19.3's third reason claims, the same way earlier chapters had you measure claimed benefits directly rather than accept them on description alone.
+
+**Exercise 4 — Sweep the persistent grid size deliberately.** Dump the TTGIR for your persistent matmul kernel (Chapter 14) and locate the `tl.range` loop. Then deliberately launch with a number of programs smaller than, and larger than, your GPU's actual `NUM_SMS`, and reason through (with benchmark evidence) what happens in each direction — undersubscription leaves SMs idle; oversubscription reintroduces some of the scheduling overhead persistent kernels exist to avoid.
+
+**Exercise 5 (exploratory) — Confront the three-loop pipelining limit.** If you're comfortable going further, implement a group GEMM with the full three-nested-loop structure §19.7 describes (group loop, tile loop, K-reduction loop), inspect the TTGIR to confirm which loop actually gets pipelined by default, and reflect on why — tying back to Chapter 14's compiler-pipeline discussion — before attempting (or simply reading about) the manual loop-fusion workaround.
+
+## 19.9 Check Your Understanding
+
+1. Explain, in your own words, the difference between "fewer launches" and "better scheduling balance" as distinct benefits of persistent kernels — construct a scenario where a persistent kernel would help with one but not meaningfully help with the other.
+2. Why does the tail-effect benefit of persistent scheduling matter far more for group GEMM/MoE than for an ordinary, single, uniformly-tiled matmul?
+3. In your own words, how does group GEMM's grouped launch schedule generalize Chapter 9's grouped tile-ordering trick? What stays the same about the underlying principle, and what changes about its scope?
+4. Why does TMA's benefit in a group GEMM context (§19.5) get described in terms of freeing SM resources, rather than purely "faster loads" the way Chapter 5 first introduced it?
+
+## 19.10 What's Next
+
+Chapter 20 returns to precision, picking up where Chapter 10 left off: block-scaled matmul using FP8 and the even lower-precision MXFP4/NVFP4 formats — the current frontier for LLM inference throughput, and the concrete payoff of Chapter 10's `max_num_imprecise_acc` preview and this chapter's group-GEMM scheduling machinery combined, since production low-precision MoE kernels routinely need both.
